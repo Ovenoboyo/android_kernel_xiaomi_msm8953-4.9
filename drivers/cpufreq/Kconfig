@@ -228,6 +228,12 @@ config CPU_FREQ_GOV_CONSERVATIVE
 
 	  If in doubt, say N.
 
+config CPU_FREQ_GOV_ELECTRON
+        tristate "'electron' cpufreq governor"
+        depends on CPU_FREQ
+        help
+          'electron' - another tuned interactive with extra options
+
 config CPU_BOOST
 	tristate "Event base short term CPU freq boost"
 	depends on CPU_FREQ
