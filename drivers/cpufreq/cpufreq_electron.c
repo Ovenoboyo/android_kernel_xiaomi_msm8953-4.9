@@ -328,10 +328,9 @@ static unsigned int choose_freq(struct cpufreq_electron_policyinfo *pcpu,
 		 * than or equal to the target load.
 		 */
 
-		if (cpufreq_frequency_table_target(
-			    pcpu->policy, pcpu->freq_table, loadadjfreq / tl,
-			    CPUFREQ_RELATION_L, &index))
-			break;
+		index = cpufreq_frequency_table_target(&pcpu->policy,
+						       loadadjfreq / tl,
+						       CPUFREQ_RELATION_L);
 		freq = pcpu->freq_table[index].frequency;
 
 		if (freq > prevfreq) {
@@ -343,11 +342,9 @@ static unsigned int choose_freq(struct cpufreq_electron_policyinfo *pcpu,
 				 * Find the highest frequency that is less
 				 * than freqmax.
 				 */
-				if (cpufreq_frequency_table_target(
-					    pcpu->policy, pcpu->freq_table,
-					    freqmax - 1, CPUFREQ_RELATION_H,
-					    &index))
-					break;
+				index = cpufreq_frequency_table_target(
+					    &pcpu->policy,
+					    freqmin + 1, CPUFREQ_RELATION_L);
 				freq = pcpu->freq_table[index].frequency;
 
 				if (freq == freqmin) {
@@ -371,9 +368,8 @@ static unsigned int choose_freq(struct cpufreq_electron_policyinfo *pcpu,
 				 * than freqmin.
 				 */
 				if (cpufreq_frequency_table_target(
-					    pcpu->policy, pcpu->freq_table,
-					    freqmin + 1, CPUFREQ_RELATION_L,
-					    &index))
+					    pcpu->policy,
+					    freqmin + 1, CPUFREQ_RELATION_L))
 					break;
 				freq = pcpu->freq_table[index].frequency;
 
@@ -549,12 +545,8 @@ static void cpufreq_electron_timer(unsigned long data)
 
 	ppol->hispeed_validate_time = now;
 
-	if (cpufreq_frequency_table_target(ppol->policy, ppol->freq_table,
-					   new_freq, CPUFREQ_RELATION_L,
-					   &index)) {
-		spin_unlock_irqrestore(&ppol->target_freq_lock, flags);
-		goto rearm;
-	}
+	index = cpufreq_frequency_table_target(&ppol->policy, new_freq,
+					   CPUFREQ_RELATION_L);
 
 	new_freq = ppol->freq_table[index].frequency;
 
@@ -1605,189 +1597,226 @@ static struct cpufreq_electron_tunables *get_tunables(
 		return cached_common_tunables;
 }
 
-static int cpufreq_governor_electron(struct cpufreq_policy *policy,
-		unsigned int event)
+/* Electron Governor callbacks */
+struct electron_governor {
+	struct cpufreq_governor gov;
+	unsigned int usage_count;
+};
+
+static struct electron_governor electron_gov;
+
+#define CPU_FREQ_GOV_ELECTRON	(&electron_gov.gov)
+
+int cpufreq_electron_init(struct cpufreq_policy *policy)
 {
 	int rc;
 	struct cpufreq_electron_policyinfo *ppol;
 	struct cpufreq_frequency_table *freq_table;
 	struct cpufreq_electron_tunables *tunables;
-	unsigned long flags;
-	unsigned int anyboost;
 
 	if (have_governor_per_policy())
 		tunables = policy->governor_data;
 	else
 		tunables = common_tunables;
 
-	BUG_ON(!tunables && (event != CPUFREQ_GOV_POLICY_INIT));
+	ppol = get_policyinfo(policy);
+	if (IS_ERR(ppol))
+		return PTR_ERR(ppol);
 
-	switch (event) {
-	case CPUFREQ_GOV_POLICY_INIT:
-		ppol = get_policyinfo(policy);
-		if (IS_ERR(ppol))
-			return PTR_ERR(ppol);
-
-		if (have_governor_per_policy()) {
-			WARN_ON(tunables);
-		} else if (tunables) {
-			tunables->usage_count++;
-			policy->governor_data = tunables;
-			return 0;
-		}
-
-		tunables = get_tunables(ppol);
-		if (!tunables) {
-			tunables = alloc_tunable(policy);
-			if (IS_ERR(tunables))
-				return PTR_ERR(tunables);
-		}
-
-		tunables->usage_count = 1;
+	if (have_governor_per_policy()) {
+		WARN_ON(tunables);
+	} else if (tunables) {
+		tunables->usage_count++;
 		policy->governor_data = tunables;
-		if (!have_governor_per_policy()) {
-			WARN_ON(cpufreq_get_global_kobject());
-			common_tunables = tunables;
-		}
-
-		rc = sysfs_create_group(get_governor_parent_kobj(policy),
-				get_sysfs_attr());
-		if (rc) {
-			kfree(tunables);
-			policy->governor_data = NULL;
-			if (!have_governor_per_policy()) {
-				common_tunables = NULL;
-				cpufreq_put_global_kobject();
-			}
-			return rc;
-		}
-
-		if (!policy->governor->initialized)
-			cpufreq_register_notifier(&cpufreq_notifier_block,
-					CPUFREQ_TRANSITION_NOTIFIER);
-
-		if (tunables->use_sched_load)
-			cpufreq_electron_enable_sched_input(tunables);
-
-		if (have_governor_per_policy())
-			ppol->cached_tunables = tunables;
-		else
-			cached_common_tunables = tunables;
-
-		break;
-
-	case CPUFREQ_GOV_POLICY_EXIT:
-		if (!--tunables->usage_count) {
-			if (policy->governor->initialized == 1)
-				cpufreq_unregister_notifier(&cpufreq_notifier_block,
-						CPUFREQ_TRANSITION_NOTIFIER);
-
-			sysfs_remove_group(get_governor_parent_kobj(policy),
-					get_sysfs_attr());
-			if (!have_governor_per_policy())
-				cpufreq_put_global_kobject();
-			common_tunables = NULL;
-		}
-
-		policy->governor_data = NULL;
-
-		if (tunables->use_sched_load)
-			cpufreq_electron_disable_sched_input(tunables);
-
-		break;
-
-	case CPUFREQ_GOV_START:
-		mutex_lock(&gov_lock);
-
-		freq_table = cpufreq_frequency_get_table(policy->cpu);
-
-		ppol = per_cpu(polinfo, policy->cpu);
-		ppol->policy = policy;
-		ppol->target_freq = policy->cur;
-		ppol->freq_table = freq_table;
-		ppol->floor_freq = ppol->target_freq;
-		ppol->floor_validate_time = ktime_to_us(ktime_get());
-		ppol->hispeed_validate_time = ppol->floor_validate_time;
-		ppol->min_freq = policy->min;
-		ppol->reject_notification = true;
-		down_write(&ppol->enable_sem);
-		del_timer_sync(&ppol->policy_timer);
-		del_timer_sync(&ppol->policy_slack_timer);
-		ppol->policy_timer.data = policy->cpu;
-		ppol->last_evaluated_jiffy = get_jiffies_64();
-		cpufreq_electron_timer_start(tunables, policy->cpu);
-		ppol->governor_enabled = 1;
-		up_write(&ppol->enable_sem);
-		ppol->reject_notification = false;
-
-		mutex_unlock(&gov_lock);
-		break;
-
-	case CPUFREQ_GOV_STOP:
-		mutex_lock(&gov_lock);
-
-		ppol = per_cpu(polinfo, policy->cpu);
-		ppol->reject_notification = true;
-		down_write(&ppol->enable_sem);
-		ppol->governor_enabled = 0;
-		ppol->target_freq = 0;
-		del_timer_sync(&ppol->policy_timer);
-		del_timer_sync(&ppol->policy_slack_timer);
-		up_write(&ppol->enable_sem);
-		ppol->reject_notification = false;
-
-		mutex_unlock(&gov_lock);
-		break;
-
-	case CPUFREQ_GOV_LIMITS:
-		__cpufreq_driver_target(policy,
-				policy->cur, CPUFREQ_RELATION_L);
-
-		ppol = per_cpu(polinfo, policy->cpu);
-
-		down_read(&ppol->enable_sem);
-		if (ppol->governor_enabled) {
-			spin_lock_irqsave(&ppol->target_freq_lock, flags);
-			if (policy->max < ppol->target_freq) {
-				ppol->target_freq = policy->max;
-			} else if (policy->min > ppol->target_freq) {
-				ppol->target_freq = policy->min;
-				anyboost = 1;
-			}
-			spin_unlock_irqrestore(&ppol->target_freq_lock, flags);
-
-			if (policy->min < ppol->min_freq)
-				cpufreq_electron_timer_resched(policy->cpu,
-								  true);
-			ppol->min_freq = policy->min;
-		}
-
-		up_read(&ppol->enable_sem);
-
-		if (anyboost) {
-			u64 now = ktime_to_us(ktime_get());
-
-			ppol->hispeed_validate_time = now;
-			ppol->floor_freq = policy->min;
-			ppol->floor_validate_time = now;
-		}
-
-		break;
+		return 0;
 	}
+
+	tunables = get_tunables(ppol);
+	if (!tunables) {
+		tunables = alloc_tunable(policy);
+		if (IS_ERR(tunables))
+			return PTR_ERR(tunables);
+	}
+
+	tunables->usage_count = 1;
+	policy->governor_data = tunables;
+	if (!have_governor_per_policy())
+		common_tunables = tunables;
+
+	rc = sysfs_create_group(get_governor_parent_kobj(policy),
+			get_sysfs_attr());
+	if (rc) {
+		kfree(tunables);
+		policy->governor_data = NULL;
+		if (!have_governor_per_policy())
+			common_tunables = NULL;
+		return rc;
+	}
+
+	if (!electron_gov.usage_count++)
+		cpufreq_register_notifier(&cpufreq_notifier_block,
+				CPUFREQ_TRANSITION_NOTIFIER);
+
+	if (tunables->use_sched_load)
+		cpufreq_electron_enable_sched_input(tunables);
+
+	if (have_governor_per_policy())
+		ppol->cached_tunables = tunables;
+	else
+		cached_common_tunables = tunables;
+
 	return 0;
 }
 
-#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_ELECTRON
-static
-#endif
-struct cpufreq_governor cpufreq_gov_electron = {
-	.name = "electron",
-	.governor = cpufreq_governor_electron,
-	.max_transition_latency = 10000000,
-	.owner = THIS_MODULE,
+void cpufreq_electron_exit(struct cpufreq_policy *policy)
+{
+	struct cpufreq_electron_tunables *tunables;
+
+	if (have_governor_per_policy())
+		tunables = policy->governor_data;
+	else
+		tunables = common_tunables;
+
+	BUG_ON(!tunables);
+
+	if (!--tunables->usage_count) {
+		/* Last policy using the governor ? */
+		if (!--electron_gov.usage_count)
+			cpufreq_unregister_notifier(&cpufreq_notifier_block,
+					CPUFREQ_TRANSITION_NOTIFIER);
+
+		sysfs_remove_group(get_governor_parent_kobj(policy),
+				get_sysfs_attr());
+
+		common_tunables = NULL;
+	}
+
+	policy->governor_data = NULL;
+
+	if (tunables->use_sched_load)
+		cpufreq_electron_disable_sched_input(tunables);
+}
+
+int cpufreq_electron_start(struct cpufreq_policy *policy)
+{
+	struct cpufreq_electron_policyinfo *ppol;
+	struct cpufreq_frequency_table *freq_table;
+	struct cpufreq_electron_tunables *tunables;
+
+	if (have_governor_per_policy())
+		tunables = policy->governor_data;
+	else
+		tunables = common_tunables;
+	BUG_ON(!tunables);
+	mutex_lock(&gov_lock);
+
+	freq_table = policy->freq_table;
+        ppol = per_cpu(polinfo, policy->cpu);
+        ppol->policy = policy;
+        ppol->target_freq = policy->cur;
+        ppol->freq_table = freq_table;
+        ppol->floor_freq = ppol->target_freq;
+        ppol->floor_validate_time = ktime_to_us(ktime_get());
+        ppol->hispeed_validate_time = ppol->floor_validate_time;
+        ppol->min_freq = policy->min;
+        ppol->reject_notification = true;
+        down_write(&ppol->enable_sem);
+        del_timer_sync(&ppol->policy_timer);
+        del_timer_sync(&ppol->policy_slack_timer);
+        ppol->policy_timer.data = policy->cpu;
+        ppol->last_evaluated_jiffy = get_jiffies_64();
+        cpufreq_electron_timer_start(tunables, policy->cpu);
+        ppol->governor_enabled = 1;
+        up_write(&ppol->enable_sem);
+        ppol->reject_notification = false;
+        mutex_unlock(&gov_lock);
+
+        return 0;
+}
+void cpufreq_electron_stop(struct cpufreq_policy *policy)
+{
+	struct cpufreq_electron_policyinfo *ppol;
+	struct cpufreq_electron_tunables *tunables;
+	if (have_governor_per_policy())
+		tunables = policy->governor_data;
+	else
+		tunables = common_tunables;
+	BUG_ON(!tunables);
+        mutex_lock(&gov_lock);
+
+        ppol = per_cpu(polinfo, policy->cpu);
+        ppol->reject_notification = true;
+        down_write(&ppol->enable_sem);
+        ppol->governor_enabled = 0;
+        ppol->target_freq = 0;
+        del_timer_sync(&ppol->policy_timer);
+        del_timer_sync(&ppol->policy_slack_timer);
+        up_write(&ppol->enable_sem);
+        ppol->reject_notification = false;
+
+        mutex_unlock(&gov_lock);
+}
+
+void cpufreq_electron_limits(struct cpufreq_policy *policy)
+{
+	struct cpufreq_electron_policyinfo *ppol;
+	struct cpufreq_electron_tunables *tunables;
+	unsigned int anyboost;
+	unsigned long flags;
+
+	if (have_governor_per_policy())
+		tunables = policy->governor_data;
+	else
+		tunables = common_tunables;
+	BUG_ON(!tunables);
+                __cpufreq_driver_target(policy,
+                                policy->cur, CPUFREQ_RELATION_L);
+
+                ppol = per_cpu(polinfo, policy->cpu);
+
+                down_read(&ppol->enable_sem);
+                if (ppol->governor_enabled) {
+                        spin_lock_irqsave(&ppol->target_freq_lock, flags);
+                        if (policy->max < ppol->target_freq) {
+                                ppol->target_freq = policy->max;
+                        } else if (policy->min > ppol->target_freq) {
+                                ppol->target_freq = policy->min;
+                                anyboost = 1;
+                        }
+                        spin_unlock_irqrestore(&ppol->target_freq_lock, flags);
+
+                        if (policy->min < ppol->min_freq)
+                                cpufreq_electron_timer_resched(policy->cpu,
+                                                                  true);
+                        ppol->min_freq = policy->min;
+                }
+
+                up_read(&ppol->enable_sem);
+
+                if (anyboost) {
+                        u64 now = ktime_to_us(ktime_get());
+
+                        ppol->hispeed_validate_time = now;
+                        ppol->floor_freq = policy->min;
+                        ppol->floor_validate_time = now;
+                }
+}
+
+static struct electron_governor electron_gov = {
+	.gov = {
+		.name			= "electron",
+		.max_transition_latency	= 10000000,
+		.owner			= THIS_MODULE,
+		.init			= cpufreq_electron_init,
+		.exit			= cpufreq_electron_exit,
+		.start			= cpufreq_electron_start,
+		.stop			= cpufreq_electron_stop,
+		.limits			= cpufreq_electron_limits,
+	}
 };
 
-static int __init cpufreq_electron_init(void)
+
+static int __init cpufreq_electron_gov_init(void)
 {
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
 
@@ -1806,20 +1835,25 @@ static int __init cpufreq_electron_init(void)
 	/* NB: wake up so the thread does not look hung to the freezer */
 	wake_up_process(speedchange_task);
 
-	return cpufreq_register_governor(&cpufreq_gov_electron);
+	return cpufreq_register_governor(CPU_FREQ_GOV_ELECTRON);
 }
 
 #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_ELECTRON
-fs_initcall(cpufreq_electron_init);
+struct cpufreq_governor *cpufreq_default_governor(void)
+{
+	return CPU_FREQ_GOV_ELECTRON;
+}
+
+fs_initcall(cpufreq_electron_gov_init);
 #else
-module_init(cpufreq_electron_init);
+module_init(cpufreq_electron_gov_init);
 #endif
 
-static void __exit cpufreq_electron_exit(void)
+static void __exit cpufreq_electron_gov_exit(void)
 {
 	int cpu;
 
-	cpufreq_unregister_governor(&cpufreq_gov_electron);
+	cpufreq_unregister_governor(CPU_FREQ_GOV_ELECTRON);
 	kthread_stop(speedchange_task);
 	put_task_struct(speedchange_task);
 
@@ -1827,7 +1861,7 @@ static void __exit cpufreq_electron_exit(void)
 		free_policyinfo(cpu);
 }
 
-module_exit(cpufreq_electron_exit);
+module_exit(cpufreq_electron_gov_exit);
 
 MODULE_AUTHOR("Mike Chan <mike@android.com>");
 MODULE_AUTHOR("Joe Maples <joe@frap129.org>");
