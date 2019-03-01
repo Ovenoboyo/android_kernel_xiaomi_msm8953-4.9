@@ -589,6 +589,11 @@
 		qcom,mdss-dsi-cold_gamma-command-state = "dsi_lp_mode";
 		qcom,mdss-dsi-warm_gamma-command-state = "dsi_lp_mode";
 		qcom,mdss-dsi-default_gamma-command-state = "dsi_lp_mode";
+
+		qcom,mdss-dsi-panel-hdr-enabled;
+		qcom,mdss-dsi-panel-hdr-color-primaries = <14500 15500 32000
+			17000 15500 30000 8000 3000>;
+
 		qcom,mdss-white-command-state = "dsi_lp_mode";
 		qcom,mdss-dsi-sRGB_on-command-state = "dsi_lp_mode";
 		qcom,mdss-dsi-sRGB_off-command-state = "dsi_lp_mode";

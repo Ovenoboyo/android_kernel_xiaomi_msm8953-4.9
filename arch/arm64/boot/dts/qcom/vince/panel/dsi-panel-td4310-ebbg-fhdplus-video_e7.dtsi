@@ -540,6 +540,11 @@
 		qcom,mdss-dsi-sRGB_on-command-state = "dsi_lp_mode";
 		qcom,mdss-dsi-sRGB_off-command-state = "dsi_lp_mode";
 		qcom,mdss-white-command-state = "dsi_lp_mode";
+
+		qcom,mdss-dsi-panel-hdr-enabled;
+		qcom,mdss-dsi-panel-hdr-color-primaries = <14500 15500 32000
+			17000 15500 30000 8000 3000>;
+
 		qcom,mdss-dsi-h-sync-pulse = <1>;
 		qcom,mdss-dsi-traffic-mode = "burst_mode";
 		qcom,mdss-dsi-bllp-eof-power-mode;
